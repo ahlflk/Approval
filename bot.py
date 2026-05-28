@@ -28,7 +28,7 @@ ADMIN_ID = 5376544115
 DEFAULT_LIMIT = 5  # ကုဒ်ဟောင်းမှ ဒေတာများအတွက် အော်တိုသတ်မှတ်ပေးမည့် Limit ဟောင်း
 
 GITHUB_TOKEN = os.getenv("GH_TOKEN") 
-REPO_OWNER = "ahlflk" 
+REPO_OWNER = "GodForYou2" 
 REPO_NAME = "Approval" 
 FILE_PATH = "key.txt" 
 RESELLER_FILE_PATH = "resellers.txt" 
