@@ -8,7 +8,7 @@ from flask import Flask, request
 from datetime import datetime
 
 # ================= [ CONFIGURATION & ENV ] =================
-BOT_TOKEN = os.getenv("BT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # ဥပမာ - https://your-app-name.onrender.com
 ADMIN_ID = 5376544115
 DEFAULT_LIMIT = 5  
@@ -145,7 +145,7 @@ def pull_data_from_github():
                             user_role = 'admin' if target_tg_id == ADMIN_ID else 'reseller'
                             cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (target_tg_id, parts[1], user_role, DEFAULT_LIMIT))
             
-            cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, 'admin', 999999)", (ADMIN_ID, 'Main_Admin'))
+            cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, 'admin', 9999999)", (ADMIN_ID, 'Main_Admin'))
             conn.commit()
             conn.close()
             print("[+] Success: Resellers database updated smoothly.")
@@ -169,7 +169,7 @@ def init_db():
         role TEXT,
         daily_limit INTEGER DEFAULT 5
     )''')
-    cursor.execute("INSERT OR IGNORE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (ADMIN_ID, 'Main_Admin', 'admin', 999999))
+    cursor.execute("INSERT OR IGNORE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (ADMIN_ID, 'Main_Admin', 'admin', 9999999))
     
     try: cursor.execute("ALTER TABLE auth_keys ADD COLUMN created_at TEXT")
     except: pass
@@ -278,7 +278,7 @@ def get_user_name(user_id):
     return res[0] if res else f"Unknown ({user_id})"
 
 def get_reseller_daily_limit(user_id):
-    if user_id == ADMIN_ID: return 999999
+    if user_id == ADMIN_ID: return 9999999
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT daily_limit FROM users WHERE tg_id = ?", (user_id,))
@@ -457,7 +457,7 @@ def cmd_addkey(message):
             bot.reply_to(message, f"❌ **တားဆီးထားပါသည်!**\n\nသင်သည် ယနေ့အတွက် သတ်မှတ်ထားသော သင့်ကိုယ်ပိုင် Key အကန့်အသတ် **{user_limit} ခု** ပြည့်သွားပါပြီ။ မနက်ဖြန်မှသာ ထပ်မံထည့်သွင်းနိုင်ပါမည်။", parse_mode="Markdown")
             return
     user_states[user_id] = 'waiting_for_key'
-    msg_text = ("✍️ ကျေးဇူးပြု၍ Key အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း တိကျစွာ ပို့ပေးပါ-\n\n`ID | Key | Unit | Duration`\n\n💡 **ပုံစံနမူနာ:**\n• `F4AFA83F4F1577DE | XYZ-KEY-999 | 3 | d`")
+    msg_text = ("✍️ ကျေးဇူးပြု၍ Key အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း တိကျစွာ ပို့ပေးပါ-\n\n`ID | Key | Unit | Duration`\n\n💡 **ပုံစံနမူနာ:**\n• `F4AFA83F4F1577DE | AHLFLK2025 | 30 | d`")
     bot.reply_to(message, msg_text, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_key' and msg.text not in MENU_BUTTONS)
@@ -535,7 +535,7 @@ def cmd_editkey(message):
     user_states[message.from_user.id] = 'waiting_for_edit_data'
     msg_text = ("✏️ **ပြင်ဆင်လိုသော အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း ပို့ပေးပါ-**\n\n"
                 "`ရှာမည့်DeviceID | Keyသစ် | Unitသစ် | Durationသစ်`\n\n"
-                "💡 **ပုံစံနမူနာ:**\n`F4AFA83F4F1577DE | NEW-KEY-888 | 5 | m`")
+                "💡 **ပုံစံနမူနာ:**\n`F4AFA83F4F1577DE | AHLFLK2025 | 30 | d`")
     bot.reply_to(message, msg_text, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_edit_data' and msg.text not in MENU_BUTTONS)
