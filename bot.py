@@ -534,7 +534,7 @@ def cmd_mykeys(message):
 def cmd_editkey(message):
     user_states[message.from_user.id] = 'waiting_for_edit_data'
     msg_text = ("✏️ **ပြင်ဆင်လိုသော အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း ပို့ပေးပါ-**\n\n"
-                "`ရှာမည့်DeviceID | Keyသစ် | Unitသစ် | Durationသစ်`\n\n"
+                "`🔎 ရှာမည့် DeviceID | Keyသစ် | Unitသစ် | Durationသစ်`\n\n"
                 "💡 **ပုံစံနမူနာ:**\n`F4AFA83F4F1577DE | AHLFLK2025 | 30 | d`")
     bot.reply_to(message, msg_text, parse_mode="Markdown")
 
