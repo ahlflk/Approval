@@ -6,27 +6,35 @@ import telebot
 import html  # Code ရဲ့ အပေါ်ဆုံးမှာ ရှိနေပါစေ
 from telebot import types
 import threading
-from flask import Flask
+from flask import Flask, request, abort
 from datetime import datetime
 
-# ================= [ FLASK WEB SERVER FOR RENDER (NO SLEEP) ] =================
-# YG- ID များကို ထည့်ခွင့်ပြုထားသော User ID များ
-# ဥပမာ - 7695807003 (Rhiso) ကို ထည့်ခွင့်ပေးချင်တယ်ဆိုရင်
+# ================= [ FLASK WEB SERVER FOR WEBHOOK & RENDER ] =================
 SPECIAL_RESELLERS = {}
 app = Flask('')
 
+# Environment Variable မှတစ်ဆင့် Render URL ကို ယူမည် (ဥပမာ- https://your-app.onrender.com)
+PUBLIC_URL = os.environ.get("PUBLIC_URL") 
+
 @app.route('/')
 def home():
-    return "Bot is running 24/7 without sleeping!"
+    return "Bot is running via Webhook 24/7!"
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+# Telegram Webhook မှ ပို့လိုက်သော Update များကို လက်ခံမည့် Route
+@app.route(f'/{os.environ.get("BOT_TOKEN")}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    else:
+        abort(403)
 
 # ================= [ CONFIGURATION ] =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("TGC_ID")) if os.environ.get("TGC_ID") else None
-DEFAULT_LIMIT = 5  # ကုဒ်ဟောင်းမှ ဒေတာများအတွက် အော်တိုသတ်မှတ်ပေးမည့် Limit ဟောင်း
+DEFAULT_LIMIT = 5  
 
 GITHUB_TOKEN = os.environ.get("GH_TOKEN")
 REPO_OWNER = "GodForYou2" 
@@ -454,8 +462,6 @@ def callback_delete_reseller(call):
     except Exception as e: bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
 
 # 4. View All Keys
-
-
 @bot.message_handler(func=lambda msg: msg.text == "🌐 View All Keys" and is_admin(msg.from_user.id))
 def admin_view_all_keys(message):
     try:
@@ -465,7 +471,6 @@ def admin_view_all_keys(message):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # User တစ်ယောက်ချင်းစီအလိုက် Key အရေအတွက်ကိုပဲ GROUP BY သုံးပြီး ကျစ်ကျစ်လျစ်လျစ် ဆွဲထုတ်ခြင်း
         query = """
             SELECT added_by, COUNT(*) as total_keys 
             FROM auth_keys 
@@ -479,35 +484,30 @@ def admin_view_all_keys(message):
         if not rows:
             return bot.reply_to(message, "📭 Database ထဲတွင် Key မရှိသေးပါ။")
 
-        # ဇယားပုံစံ ခေါင်းစဉ်
         res = "📊 <b>RESELLER KEYS SUMMARY REPORT</b>\n"
         res += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         res += "<b>No  |  Name (ID)  |  Added ID Count</b>\n"
         res += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         
-        total_all_keys = 0 # Database တစ်ခုလုံးမှာရှိတဲ့ Key စုစုပေါင်းကိုပါ တွက်ရန်
+        total_all_keys = 0 
         
         for index, r in enumerate(rows, 1):
             reseller_id = r[0]
             key_count = r[1]
             total_all_keys += key_count
             
-            # Owner Name စစ်ဆေးခြင်း
             raw_owner_name = get_user_name(reseller_id)
             if not raw_owner_name or str(raw_owner_name).lower() == 'unknown' or str(raw_owner_name).lower() == 'none':
                 owner_name = "Unknown User"
             else:
                 owner_name = raw_owner_name
             
-            # HTML Safe ဖြစ်အောင်လုပ်ခြင်း
             safe_name = html.escape(str(owner_name))
             
-            # ဇယားကွက် ပုံစံဖြင့် စာကြောင်းစီခြင်း
             res += f"{index}.  <b>{safe_name}</b>\n"
             res += f"    ┗ 🆔 <code>{reseller_id}</code>  ➡️  <b>{key_count} ခု</b>\n"
             res += "────────────────────────\n"
 
-        # အောက်ခြေတွင် စုစုပေါင်း အရေအတွက်ကိုပါ ပြပေးခြင်း
         res += f"📊 <b>စုစုပေါင်း Key အားလုံး: {total_all_keys} ခု</b>\n"
         res += "━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -516,16 +516,7 @@ def admin_view_all_keys(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Error ဖြစ်သွားပါသည်: {str(e)}")
 
-        
-        
-        
-            
-            
-        
-        
-    
-
-# 5. Add Key (🌟 Fix တာကွက် - bot.reply_to စာသားနေရာတွင် message ပိုဇစ်ရှင် ထည့်သွင်းပြင်ဆင်ပြီး)
+# 5. Add Key 
 @bot.message_handler(func=lambda msg: msg.text == "➕ Add Key" and is_reseller(msg.from_user.id))
 def cmd_addkey(message):
     user_id = message.from_user.id
@@ -557,7 +548,6 @@ def process_key_data(message):
         return bot.reply_to(message, "❌ ပုံစံမမှန်ပါ။ `ID | Key | Unit | Duration` အတိုင်း ပြန်လည်ပေးပို့ပါ။")
     
     target_id = parts[0]
-    # 🌟 Admin မဟုတ်သူများအတွက် YG- ID တားဆီးခြင်း
     if not is_admin(user_id) and user_id not in SPECIAL_RESELLERS and target_id.startswith("YG-,AL-"):
         user_states[user_id] = None
         return bot.reply_to(message, "❌ **Internet Bypass reseller ဝယ်ယူပါ ")
@@ -588,7 +578,6 @@ def process_key_data(message):
             rem = user_limit - get_today_added_count(user_id)
             success_msg += f"\n\n📊 **ယနေ့အခြေအနေ:** ထည့်ပြီး {get_today_added_count(user_id)} ခု / ထပ်ထည့်နိုင်သေးသည် {rem} ခု (Limit: {user_limit} ခု)"
             
-        # 🌟 ပြင်ဆင်ပြီးချက် - message ပိုဇစ်ရှင် argument ပြန်ထည့်ပေးလိုက်ပါပြီ
         bot.reply_to(message, success_msg)
         sync_db_to_github()
         
@@ -599,8 +588,6 @@ def process_key_data(message):
         user_states[user_id] = None
 
 # 6. View My Keys
-
-
 @bot.message_handler(func=lambda msg: msg.text == "🔑 My Keys" and is_reseller(msg.from_user.id))
 def cmd_mykeys(message):
     try:
@@ -616,11 +603,9 @@ def cmd_mykeys(message):
         if not rows: 
             return bot.reply_to(message, "📭 သင်ထည့်သွင်းထားသော Key မရှိသေးပါ။")
             
-        # ခေါင်းစဉ်ပိုင်းကို သပ်ရပ်အောင် ပြင်ဆင်ခြင်း
         header = "🔑 <b>MY AUTHORIZED KEYS LIST</b>\n"
         header += "━ မိမိထုတ်ထားသော ID/Keyစာရင်း ━\n\n"
         
-        # Admin မဟုတ်ရင် Daily Limit ဘားလေး ပြပေးမယ်
         if not is_admin(message.from_user.id):
             user_limit = get_reseller_daily_limit(message.from_user.id)
             today_count = get_today_added_count(message.from_user.id)
@@ -631,16 +616,13 @@ def cmd_mykeys(message):
             
         res = header
         
-        # Key တစ်ခုချင်းစီကို Box Layout ပုံစံဖြင့် စီရရီ ပြသခြင်း
         for index, r in enumerate(rows, 1):
             date_str = r[3] if r[3] else "-"
             
-            # HTML Safe ဖြစ်အောင်လုပ်ခြင်း
             safe_target = html.escape(str(r[0]))
             safe_key = html.escape(str(r[1]))
             safe_date = html.escape(str(date_str))
             
-            # ပိုမို ကြည့်ကောင်းပြီး ကူးရလွယ်ကူသော ပုံစံ
             line = (
                 f"<b>{index}. 🔑 Key:</b> <code>{safe_key}</code>\n"
                 f"┗ 🎯 <b>Device ID:</b> <code>{safe_target}</code>\n"
@@ -648,7 +630,6 @@ def cmd_mykeys(message):
                 f"────────────────────────\n"
             )
             
-            # Telegram Message limit 4000 ကျော်ရင် ခွဲပို့ရန်
             if len(res) + len(line) > 4000:
                 bot.send_message(message.chat.id, res, parse_mode="HTML")
                 res = "" 
@@ -659,8 +640,6 @@ def cmd_mykeys(message):
             
     except Exception as e:
         bot.reply_to(message, f"❌ Error ဖြစ်သွားပါသည်: {str(e)}")
-    
-    
 
 # 7. Edit Key
 @bot.message_handler(func=lambda msg: msg.text == "✏️ Edit Key" and is_reseller(msg.from_user.id))
@@ -747,6 +726,18 @@ def process_delete_key_by_id(message):
 
 # --- Main Run ---
 if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    print("[+] Flask Web Server + Telegram Bot Running 24/7 on Render...")
-    bot.infinity_polling()
+    # Web server မစတင်မီ ရှိပြီးသား Webhook ကို ဖျက်ပြီး အသစ် ပြန်ချိတ်ဆက်ခြင်း
+    bot.remove_webhook()
+    
+    if PUBLIC_URL:
+        # ဥပမာ- https://your-app.onrender.com/YOUR_BOT_TOKEN ဖြင့် Webhook ချိတ်မည်
+        webhook_url = f"{PUBLIC_URL.rstrip('/')}/{BOT_TOKEN}"
+        bot.set_webhook(url=webhook_url)
+        print(f"[+] Webhook set successfully to: {webhook_url}")
+    else:
+        print("[-] Warning: PUBLIC_URL environment variable is missing. Webhook not set!")
+
+    port = int(os.environ.get("PORT", 8080))
+    # Thread မသုံးတော့ဘဲ Flask ကို Main Thread မှာ တိုက်ရိုက် Run စေခြင်း
+    print("[+] Flask Web Server + Webhook Running 24/7 on Render...")
+    app.run(host='0.0.0.0', port=port)
