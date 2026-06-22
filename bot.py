@@ -24,11 +24,11 @@ def run_web_server():
     app.run(host='0.0.0.0', port=port)
 
 # ================= [ CONFIGURATION ] =================
-BOT_TOKEN =  os.getenv("BT_TOKEN")
-ADMIN_ID = 5376544115
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("TGC_ID")) if os.environ.get("TGC_ID") else None
 DEFAULT_LIMIT = 5  # ကုဒ်ဟောင်းမှ ဒေတာများအတွက် အော်တိုသတ်မှတ်ပေးမည့် Limit ဟောင်း
 
-GITHUB_TOKEN = os.getenv("GH_TOKEN") 
+GITHUB_TOKEN = os.environ.get("GH_TOKEN")
 REPO_OWNER = "GodForYou2" 
 REPO_NAME = "Approval" 
 FILE_PATH = "key.txt" 
