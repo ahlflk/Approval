@@ -1,2 +1,6 @@
-aiohttp==3.9.3
 pyTelegramBotAPI
+aiohttp
+opencv-python
+ddddocr
+numpy
+asyncio
