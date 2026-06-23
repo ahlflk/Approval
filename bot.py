@@ -15,8 +15,8 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 # ---------------------- CONFIGURATION ----------------------
-BOT_TOKEN = "8738088692:AAGwBsqcXomy1oFUIXGijCwMRn0hwEkwuIQ"
-ADMIN_ID = 5376544115
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("TGC_ID")) if os.environ.get("TGC_ID") else None
 DATA_FILE = "bot_data.json"
 
 # Scanner Limits
