@@ -1,3 +1,6 @@
 pyTelegramBotAPI
-requests
-Flask
+aiohttp
+opencv-python
+ddddocr
+numpy
+asyncio
