@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GH_TOKEN")
 ADMIN_ID = int(os.environ.get("TGC_ID")) if os.environ.get("TGC_ID") else None
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") # Render Webhook URL
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") # https://ahlflk-2025-wifi-bot.onrender.com
 
 REPO_OWNER = "ahlflk"
 REPO_NAME = "AHLFLK2025_WiFi_Bot"
@@ -31,24 +31,25 @@ CONCURRENCY = 50
 _voucher_sem = None
 _start_time = time.monotonic()
 
-# 1. 24/7 Alive ဖြစ်စေမယ့် Home Route
+# 1. Home Route (Render Alive ဖြစ်နေစေရန်)
 async def handle_home(request):
     return web.Response(text="Bot is awake and running 24/7 via Webhook!")
 
-# 2. Telegram Webhook Updates တွေကို လက်ခံမယ့် Route
+# 2. Telegram Webhook Updates များကို လက်ခံပြီး Process လုပ်မည့်နေရာ (Bug ပြင်ဆင်ပြီး)
 async def handle_webhook(request):
-    if request.match_info.get('token') == bot.token:
+    try:
         request_body = await request.text()
         update = Update.de_json(request_body)
         await bot.process_new_updates([update])
-        return web.Response()
-    else:
-        return web.Response(status=403)
+        return web.Response(status=200)
+    except Exception as e:
+        print(f"Error processing update: {e}")
+        return web.Response(status=500)
 
 async def web_server():
     app = web.Application()
     app.router.add_get('/', handle_home)
-    # Token ပါမှ ဝင်လို့ရအောင် Endpoint ကို လုံခြုံရေးအရ ခွဲထားပါတယ်
+    # Token လမ်းကြောင်းကို တိုက်ရိုက်သတ်မှတ်ပြီး လုံခြုံရေးစိတ်ချရအောင် လုပ်ထားပါတယ်
     app.router.add_post(f'/{BOT_TOKEN}', handle_webhook)
     
     runner = web.AppRunner(app)
@@ -58,14 +59,18 @@ async def web_server():
     await site.start()
     print(f"Web server started on port {port}")
     
-    # 3. Telegram မှာ Webhook သွားရောက် ချိတ်ဆက်ခြင်း
+    # 3. Telegram Webhook URL အား ချိတ်ဆက်ခြင်း
     if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{BOT_TOKEN}"
+        # URL အဆုံးမှာ / ပါခဲ့ရင် ဖြတ်ထုတ်ပြီး လမ်းကြောင်းမှန်အောင် ညှိပေးပါတယ်
+        base_url = RENDER_EXTERNAL_URL.rstrip('/')
+        webhook_url = f"{base_url}/{BOT_TOKEN}"
+        
         await bot.remove_webhook()
+        # Webhook စနစ် ကောင်းမွန်စွာ အလုပ်လုပ်ရန် သတ်မှတ်ခြင်း
         await bot.set_webhook(url=webhook_url)
-        print(f"Webhook successfully set to: {webhook_url}")
+        print(f"🚀 Webhook successfully set to: {webhook_url}")
     else:
-        print("⚠️ Warning: RENDER_EXTERNAL_URL env variable is missing. Webhook not set!")
+        print("⚠️ Warning: RENDER_EXTERNAL_URL variable is missing in Render Environment!")
 
 async def get_file_content(path):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
@@ -358,7 +363,7 @@ async def check_session_url(session_url):
         'sec-fetch-site': 'same-origin',
         'upgrade-insecure-requests': '1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
-        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
+        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcx0QtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
     }
     try:
         async with session.get(session_url, allow_redirects=True, headers=headers) as response:
@@ -610,7 +615,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
     scan_start = time.monotonic()
     global _voucher_sem
     if _voucher_sem is None:
-        _voucher_sem = asyncioSemaphore(CONCURRENCY)
+        _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
     try:
         while True:
@@ -641,7 +646,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
                     approve[chat_id] = False
                     await bot.send_message(
                         chat_id,
-                        "သင်၏ key သက်တမ်း ကုန်ဆုံးသွားပါပြီ။"
+                        "物理သင်၏ key သက်တမ်း ကုန်ဆုံးသွားပါပြီ။"
                     )
                     scan_tasks.pop(chat_id, None)
                     success_messages.pop(chat_id, None)
@@ -1048,8 +1053,8 @@ async def main():
         # GitHub scheduler ကို task အနေဖြင့် Run ထားခြင်း
         asyncio.create_task(github_update_scheduler())
         
-        # Webhook စနစ်ဖြစ်သွားသဖြင့် infinity_polling မလိုအပ်တော့ဘဲ 
-        # Server အမြဲတမ်းပွင့်နေရန် လိုအပ်သောကြောင့် infinite sleep ဖြင့် ထိန်းထားခြင်း
+        # Webhook ဖြစ်သွားသဖြင့် infinity_polling မလိုတော့ဘဲ 
+        # Server အမြဲပွင့်နေစေရန် infinite loop ဖြင့် ထိန်းထားခြင်း
         while True:
             await asyncio.sleep(3600)
     finally:
