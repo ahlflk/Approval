@@ -129,7 +129,7 @@ async def handle_key(message):
 
 @bot.message_handler(commands=['listkeys'])
 async def listkeys(message):
-    if str(message.chat.id) != ADMIN_ID:
+    if message.chat.id != ADMIN_ID:
         await bot.reply_to(message, "No Permission")
         return
     try:
@@ -173,7 +173,7 @@ async def listkeys(message):
 
 @bot.message_handler(commands=['delkey'])
 async def delkey(message):
-    if str(message.chat.id) != ADMIN_ID:
+    if message.chat.id != ADMIN_ID:
         await bot.reply_to(message, "No Permission")
         return
     try:
@@ -204,7 +204,7 @@ async def delkey(message):
 
 @bot.message_handler(commands=['genkey'])
 async def genkey(message):
-    if str(message.chat.id) != ADMIN_ID:
+    if message.chat.id != ADMIN_ID:
         await bot.reply_to(message, "No Permission")
         return
     try:
@@ -449,7 +449,7 @@ async def scan(message):
 
 @bot.message_handler(commands=['status'])
 async def status(message):
-    if str(message.chat.id) != ADMIN_ID:
+    if message.chat.id != ADMIN_ID:
         await bot.reply_to(message, "No Permission")
         return
     active_scans = sum(
