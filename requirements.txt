@@ -1,4 +1,6 @@
 pyTelegramBotAPI
-requests
-Flask
-gunicorn
+aiohttp
+opencv-python-headless
+ddddocr
+numpy
+asyncio
